@@ -36,8 +36,9 @@ Enterprise-grade API for the Company Miner product: mine company data from URLs 
 ## API
 
 - **Base:** `http://localhost:3000/api/v1`
+- **Health:** `GET /api/v1/health` — JSON with API + DB status (200 when healthy, 503 when DB unreachable)
 - **Auth:** `POST /auth/register`, `POST /auth/login`, `GET /auth/profile` (Bearer)
-- **Company Miner:** `POST /admin/company-miner` (body: `{ "url": "https://example.com" }`) — requires auth
+- **Company Miner:** `POST /admin/company-miner` (body: `{ \"url\": \"https://example.com\" }`) — requires auth
 - **Master Services:** `GET/POST/PUT/DELETE /admin/master-services` — requires admin
 
 ## Database migrations and seeders
