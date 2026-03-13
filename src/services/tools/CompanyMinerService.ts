@@ -99,8 +99,9 @@ export class CompanyMinerService {
   /**
    * Mine company info from a website URL: fetch content, then extract via OpenAI.
    * No cache; no DB. Normalizes URL (accepts domain-only), fetches page, strips HTML, calls OpenAI, returns DTO.
+   * When an optional instruction is provided, the AI is asked to prioritize that focus area.
    */
-  async mineCompany(url: string): Promise<CompanyMinerResult> {
+  async mineCompany(url: string, instruction?: string): Promise<CompanyMinerResult> {
     const normalizedUrl = this.normalizeUrl(url);
 
     const websiteText = await this.fetchWebsiteText(normalizedUrl);
@@ -113,7 +114,7 @@ export class CompanyMinerService {
       throw new Error('AI extraction is not configured');
     }
 
-    let result = await this.extractWithOpenAI(normalizedUrl, websiteText);
+    let result = await this.extractWithOpenAI(normalizedUrl, websiteText, instruction);
 
     const yahooEnriched = await this.enrichFromYahooFinance(normalizedUrl, result);
     if (yahooEnriched) {
@@ -583,8 +584,16 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
     return stripped.slice(0, maxChars);
   }
 
-  private async extractWithOpenAI(url: string, websiteText: string): Promise<CompanyMinerResult> {
-    const systemPrompt = `You are a company intelligence assistant. Given raw text extracted from a company website, output exactly eight things in valid JSON only:
+  private async extractWithOpenAI(
+    url: string,
+    websiteText: string,
+    instruction?: string
+  ): Promise<CompanyMinerResult> {
+    const systemPrompt = `You are a company intelligence assistant. Given raw text extracted from a company website, output exactly eight things in valid JSON only.
+
+When an additional user instruction is provided, you must still populate all required fields, but you should prioritize that instruction when deciding which products, services, challenges, financials, and competitors to emphasize. Never ignore the instruction; treat it as a focus filter on what matters most for this analysis.
+
+You must always be strictly grounded in the provided website text (and any enrichment the caller passes you). Do not hallucinate or invent facts that are not clearly supported by the text.:
 1. "aboutTheCompany": a clear 2-5 sentence summary of what the company does, who they serve, and their main value proposition. Use only information present in the text; do not invent.
 2. "products": an array of product names or product categories the company offers (e.g. ["Product A", "Platform B"]). Use short strings. If none found, return [].
 3. "services": an array of services the company offers. Include explicitly listed services (e.g. Consulting, Support, Maintenance). When the site does not have a dedicated "Services" section, still infer service-like offerings from the text when present or strongly implied (e.g. B2B/Bulk supply, Export, Distribution, Private label, Custom solutions, Retail, Sourcing, Logistics). Use short strings. Only return [] when there is truly no mention or implication of any service offering.
@@ -596,7 +605,15 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
 
 Output only a single JSON object with keys: aboutTheCompany, products, services, industry, top5SourcesOfIncome, financialResultsLatest5, currentChallenges, competitors. No markdown, no code block, no extra text.`;
 
-    const userPrompt = `Website URL: ${url}\n\nWebsite text (extract from this):\n${websiteText.slice(0, 12000)}`;
+    const trimmedInstruction = instruction?.trim();
+    const focusText = trimmedInstruction
+      ? `\n\nUser focus instruction (prioritize this in your analysis, while still returning all required fields):\n"${trimmedInstruction}"`
+      : '';
+
+    const userPrompt = `Website URL: ${url}\n\nWebsite text (extract from this):\n${websiteText.slice(
+      0,
+      12000
+    )}${focusText}`;
 
     try {
       const completion = await this.client!.chat.completions.create({

@@ -30,14 +30,19 @@ export const mineCompanySchema = z.object({
         },
         { message: 'URL is malformed or invalid' }
       ),
+    instruction: z
+      .string()
+      .max(150, 'Instruction must be at most 150 characters')
+      .optional()
+      .transform((val) => (val && val.trim().length > 0 ? val.trim() : undefined)),
   }),
 });
 
 export class CompanyMinerController {
   async mineCompany(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
     try {
-      const { url } = req.body as { url: string };
-      const result = await companyMinerService.mineCompany(url);
+      const { url, instruction } = req.body as { url: string; instruction?: string };
+      const result = await companyMinerService.mineCompany(url, instruction);
 
       const masterServices = await MasterService.findAll({
         where: { isActive: true },
@@ -49,10 +54,34 @@ export class CompanyMinerController {
         masterServices.map((m) => ({ id: m.id, name: m.name }))
       );
 
+      // Generate PDF (best-effort; API still returns JSON even if PDF generation fails)
+      let pdfBase64: string | undefined;
+      let pdfFilename: string | undefined;
+      try {
+        const { generateCompanyMinerPdf } = await import('../../utils/companyMinerPdf');
+        const pdf = await generateCompanyMinerPdf({
+          url,
+          instruction,
+          result,
+          suggestedServices: suggested,
+        });
+        pdfBase64 = pdf.buffer.toString('base64');
+        pdfFilename = pdf.filename;
+      } catch (pdfErr) {
+        // Log but do not fail the main response
+        // eslint-disable-next-line no-console
+        console.warn('Company Miner: PDF generation failed', pdfErr);
+      }
+
       sendSuccess(
         res,
         'Company mined successfully',
-        { ...result, suggestedServicesWeCanProvide: suggested },
+        {
+          ...result,
+          suggestedServicesWeCanProvide: suggested,
+          pdfBase64,
+          pdfFilename,
+        },
         200
       );
     } catch (err) {
