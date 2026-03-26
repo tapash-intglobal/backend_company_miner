@@ -7,6 +7,9 @@ import logger from '../../utils/logger';
 const WEBSITE_FETCH_TIMEOUT_MS = 8000;
 const WEBSITE_MAX_CHARS = 10000;
 const URL_MAX_LENGTH = 2048;
+const DEEP_SEARCH_FETCH_TIMEOUT_MS = 7000;
+const DEEP_SEARCH_DOC_MAX_CHARS = 4500;
+const DEEP_SEARCH_MAX_URLS = 8;
 
 const BLOCKED_PROTOCOLS = ['file:', 'javascript:', 'data:', 'vbscript:', 'ftp:'];
 
@@ -23,6 +26,10 @@ export interface CompanyMinerResult {
   publicSearchUsed?: boolean;
   /** True when about, industry, or financials were filled from Yahoo Finance (listed companies only). */
   yahooFinanceUsed?: boolean;
+  /** True when deep web search fallback was used for challenges/competitors. */
+  deepSearchUsed?: boolean;
+  /** Number of web sources consumed in deep search. */
+  deepSearchSourceCount?: number;
 }
 
 /** Suggested service we can provide to the mined company, with short rationale. */
@@ -30,6 +37,12 @@ export interface SuggestedServiceWeCanProvide {
   serviceId?: number;
   serviceName: string;
   rationale: string;
+}
+
+export interface GeneratedServiceEmail {
+  subject: string;
+  body: string;
+  cta: string;
 }
 
 const companyMinerResponseSchema = z.object({
@@ -189,6 +202,31 @@ export class CompanyMinerService {
           competitors: dedicatedCompetitors,
           publicSearchUsed: true,
         };
+      }
+    }
+
+    // Synchronous deep-search fallback for commonly sparse sections.
+    if (this.client && (result.currentChallenges.length === 0 || result.competitors.length === 0)) {
+      const deep = await this.enrichFromDeepSearch(normalizedUrl, result);
+      if (deep) {
+        const filledChallenges = result.currentChallenges.length === 0 && deep.currentChallenges.length > 0;
+        const filledCompetitors = result.competitors.length === 0 && deep.competitors.length > 0;
+        if (filledChallenges || filledCompetitors) {
+          result = {
+            ...result,
+            currentChallenges:
+              result.currentChallenges.length > 0
+                ? result.currentChallenges
+                : deep.currentChallenges,
+            competitors:
+              result.competitors.length > 0
+                ? result.competitors
+                : this.mergeCompetitorLists(result.competitors, deep.competitors),
+            deepSearchUsed: true,
+            deepSearchSourceCount: deep.sourceCount,
+            publicSearchUsed: true,
+          };
+        }
       }
     }
 
@@ -361,6 +399,93 @@ export class CompanyMinerService {
     }
   }
 
+  private async enrichFromDeepSearch(
+    normalizedUrl: string,
+    result: CompanyMinerResult
+  ): Promise<{ currentChallenges: string[]; competitors: string[]; sourceCount: number } | null> {
+    const domain = new URL(normalizedUrl).hostname.replace(/^www\./i, '');
+    const baseName = domain.split('.')[0] ?? domain;
+    const industryHint = result.industry?.trim() || '';
+
+    const queries = [
+      `${baseName} competitors alternatives peers`,
+      `${domain} major competitors market rivals`,
+      `${baseName} business challenges risks headwinds`,
+      `${domain} annual report risks challenges`,
+      industryHint ? `${industryHint} top companies competitors` : '',
+      industryHint ? `${industryHint} industry challenges trends risks` : '',
+    ].filter(Boolean);
+
+    const docs = await this.fetchSearchDocuments(queries);
+    if (docs.length === 0) return null;
+
+    const extracted = await this.extractChallengesAndCompetitorsFromEvidence(
+      docs.join('\n\n---\n\n'),
+      { baseName, industryHint }
+    );
+    return {
+      currentChallenges: extracted.currentChallenges.slice(0, 5),
+      competitors: extracted.competitors.slice(0, 10),
+      sourceCount: docs.length,
+    };
+  }
+
+  private async fetchSearchDocuments(queries: string[]): Promise<string[]> {
+    const uniqueUrls = new Map<string, { title?: string; snippet?: string }>();
+
+    for (const q of queries) {
+      try {
+        const searchResults = await duckDuckGoSearch(q.slice(0, 500), {
+          safeSearch: SafeSearchType.STRICT,
+        });
+        if (searchResults.noResults || !searchResults.results?.length) continue;
+
+        for (const r of searchResults.results.slice(0, 6)) {
+          const rawUrl = typeof r.url === 'string' ? r.url.trim() : '';
+          if (!rawUrl || uniqueUrls.has(rawUrl)) continue;
+          uniqueUrls.set(rawUrl, {
+            title: r.title,
+            snippet: r.description || r.rawDescription,
+          });
+          if (uniqueUrls.size >= DEEP_SEARCH_MAX_URLS) break;
+        }
+      } catch (err) {
+        logger.warn('Company Miner: deep search query failed', { query: q, error: err });
+      }
+      if (uniqueUrls.size >= DEEP_SEARCH_MAX_URLS) break;
+    }
+
+    const docs: string[] = [];
+    for (const [u, meta] of uniqueUrls.entries()) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), DEEP_SEARCH_FETCH_TIMEOUT_MS);
+        const res = await fetch(u, {
+          signal: controller.signal,
+          headers: { 'User-Agent': 'CompanyMiner/1.0 (B2B deep search)' },
+          redirect: 'follow',
+        });
+        clearTimeout(timeout);
+        if (!res.ok) continue;
+        const contentType = res.headers.get('content-type')?.toLowerCase() || '';
+        if (!contentType.includes('text/html') && !contentType.includes('text/plain')) continue;
+        const body = await res.text();
+        const extracted = this.stripHtmlAndTruncate(body, DEEP_SEARCH_DOC_MAX_CHARS);
+        const combined = [
+          meta.title ? `Title: ${meta.title}` : '',
+          meta.snippet ? `Snippet: ${meta.snippet}` : '',
+          extracted ? `Content: ${extracted}` : '',
+        ]
+          .filter(Boolean)
+          .join('\n');
+        if (combined.length >= 120) docs.push(combined);
+      } catch {
+        // Skip bad sources; deep search remains best-effort.
+      }
+    }
+    return docs;
+  }
+
   private readonly publicSearchExtractSchema = z.object({
     top5SourcesOfIncome: z.array(z.string()).optional().default([]),
     financialResultsLatest5: z.array(z.string()).optional().default([]),
@@ -488,6 +613,10 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
   private readonly competitorsOnlySchema = z.object({
     competitors: z.array(z.string()).optional().default([]),
   });
+  private readonly deepExtractSchema = z.object({
+    currentChallenges: z.array(z.string()).optional().default([]),
+    competitors: z.array(z.string()).optional().default([]),
+  });
 
   /**
    * Extract competitor/peer company names from text.
@@ -539,6 +668,64 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
     } catch (err) {
       logger.warn('Company Miner: competitor extraction failed', { mode, error: err });
       return [];
+    }
+  }
+
+  private async extractChallengesAndCompetitorsFromEvidence(
+    text: string,
+    context: { baseName: string; industryHint?: string }
+  ): Promise<{ currentChallenges: string[]; competitors: string[] }> {
+    if (!this.client) return { currentChallenges: [], competitors: [] };
+
+    const systemPrompt = `You are an enterprise research analyst.
+From the provided public web evidence, extract only verifiable:
+1) currentChallenges: up to 5 short business challenges/headwinds/risks.
+2) competitors: up to 10 company names that appear as peers/rivals/alternatives.
+
+Strict rules:
+- Grounded evidence only; do not infer beyond text.
+- Do not include the target company itself.
+- Prefer precise, business-relevant items over generic statements.
+- Output JSON only with keys: currentChallenges, competitors.`;
+
+    const userPrompt = `Target company: ${context.baseName}
+Industry hint: ${context.industryHint || 'N/A'}
+
+Evidence:
+${text.slice(0, 22000)}`;
+
+    try {
+      const completion = await this.client.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.2,
+        max_tokens: 900,
+      });
+      const raw = completion.choices[0]?.message?.content?.trim();
+      if (!raw) return { currentChallenges: [], competitors: [] };
+
+      let jsonStr = raw;
+      const codeBlockMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (codeBlockMatch) jsonStr = codeBlockMatch[1].trim();
+
+      const parsed = this.deepExtractSchema.parse(JSON.parse(jsonStr));
+      const competitors = (parsed.competitors ?? [])
+        .map((c) => c.trim())
+        .filter((c) => c.length > 1 && c.toLowerCase() !== context.baseName.toLowerCase());
+      const challenges = (parsed.currentChallenges ?? [])
+        .map((c) => c.trim())
+        .filter((c) => c.length > 3);
+
+      return {
+        currentChallenges: challenges.slice(0, 5),
+        competitors: competitors.slice(0, 10),
+      };
+    } catch (err) {
+      logger.warn('Company Miner: deep extraction failed', { error: err });
+      return { currentChallenges: [], competitors: [] };
     }
   }
 
@@ -746,6 +933,116 @@ Output valid JSON only: an array of objects with keys "serviceName" (string, mus
     } catch (err) {
       logger.warn('Company Miner: suggest services failed', { error: err });
       return [];
+    }
+  }
+
+  /**
+   * Generate a professional outreach email based on mined company data and suggested services.
+   * Includes a clear CTA for sales/marketing follow-up.
+   */
+  async generateServicePitchEmail(input: {
+    companyUrl: string;
+    minedResult: CompanyMinerResult;
+    suggestedServices: SuggestedServiceWeCanProvide[];
+    instruction?: string;
+  }): Promise<GeneratedServiceEmail> {
+    if (!this.client) {
+      throw new Error('AI extraction is not configured');
+    }
+
+    const { companyUrl, minedResult, suggestedServices, instruction } = input;
+    if (!suggestedServices.length) {
+      throw new Error('No suggested services available to generate email');
+    }
+
+    const companySummary = [
+      minedResult.aboutTheCompany && `About: ${minedResult.aboutTheCompany}`,
+      minedResult.industry && `Industry: ${minedResult.industry}`,
+      minedResult.products?.length && `Products: ${minedResult.products.join('; ')}`,
+      minedResult.services?.length && `Current services: ${minedResult.services.join('; ')}`,
+      minedResult.currentChallenges?.length &&
+        `Current challenges: ${minedResult.currentChallenges.join('; ')}`,
+    ]
+      .filter(Boolean)
+      .join('\n');
+
+    const servicesContext = suggestedServices
+      .map((s, idx) => `${idx + 1}. ${s.serviceName}: ${s.rationale}`)
+      .join('\n');
+
+    const extraInstruction = instruction?.trim()
+      ? `\nAdditional instruction from user: "${instruction.trim()}"`
+      : '';
+
+    const systemPrompt = `You are a senior enterprise B2B sales copywriter.
+Generate a concise, professional outreach email for a potential client using provided context.
+
+Rules:
+1. Output valid JSON only with keys: subject, body, cta.
+2. Subject: 6-12 words, professional, no spammy tone.
+3. Body: 140-220 words, polished business tone, personalized to the company's context and pain points.
+4. Body formatting is mandatory: return exactly 3-4 short paragraphs separated by blank lines ("\\n\\n"), each paragraph 1-3 sentences.
+5. Body should include: a brief opener, value proposition tied to suggested services, and a concise closing.
+6. Mention 2-3 suggested services naturally with business value.
+7. Include exactly one clear CTA (meeting/call/demo/reply) with urgency but no hype.
+8. Avoid exaggerated claims, fake metrics, or unsupported promises.
+9. Do not use markdown, HTML, bullet lists, or code blocks.`;
+
+    const userPrompt = `Company URL: ${companyUrl}
+
+Company context:
+${companySummary.slice(0, 4500)}
+
+Suggested services to pitch:
+${servicesContext.slice(0, 3500)}${extraInstruction}
+
+Generate the JSON response now.`;
+
+    try {
+      const completion = await this.client.chat.completions.create({
+        model: 'gpt-4o-mini',
+        messages: [
+          { role: 'system', content: systemPrompt },
+          { role: 'user', content: userPrompt },
+        ],
+        temperature: 0.3,
+        max_tokens: 900,
+      });
+
+      const raw = completion.choices[0]?.message?.content?.trim();
+      if (!raw) {
+        throw new Error('AI returned no content');
+      }
+
+      let jsonStr = raw;
+      const codeBlockMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
+      if (codeBlockMatch) jsonStr = codeBlockMatch[1].trim();
+
+      const parsed = JSON.parse(jsonStr) as {
+        subject?: unknown;
+        body?: unknown;
+        cta?: unknown;
+      };
+
+      const subject = typeof parsed.subject === 'string' ? parsed.subject.trim() : '';
+      const body = typeof parsed.body === 'string' ? parsed.body.trim() : '';
+      const cta = typeof parsed.cta === 'string' ? parsed.cta.trim() : '';
+
+      if (!subject || !body || !cta) {
+        throw new Error('AI extraction returned invalid structure');
+      }
+
+      return { subject, body, cta };
+    } catch (err) {
+      if (err instanceof SyntaxError) {
+        logger.warn('Company Miner: generated email was not valid JSON', { error: err });
+        throw new Error('AI extraction returned invalid response');
+      }
+      if (err instanceof Error && err.message.startsWith('AI ')) {
+        throw err;
+      }
+      logger.warn('Company Miner: generate email failed', { error: err });
+      throw new Error('AI extraction failed');
     }
   }
 }

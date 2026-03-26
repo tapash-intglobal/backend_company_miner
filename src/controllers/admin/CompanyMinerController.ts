@@ -38,6 +38,39 @@ export const mineCompanySchema = z.object({
   }),
 });
 
+export const generateServiceEmailSchema = z.object({
+  body: z.object({
+    companyUrl: z
+      .string()
+      .min(1, 'Company URL is required')
+      .max(2048, 'Company URL must be at most 2048 characters'),
+    minedResult: z.object({
+      aboutTheCompany: z.string(),
+      products: z.array(z.string()),
+      services: z.array(z.string()),
+      industry: z.string(),
+      top5SourcesOfIncome: z.array(z.string()),
+      financialResultsLatest5: z.array(z.string()),
+      currentChallenges: z.array(z.string()),
+      competitors: z.array(z.string()),
+      publicSearchUsed: z.boolean().optional(),
+      yahooFinanceUsed: z.boolean().optional(),
+    }),
+    suggestedServices: z.array(
+      z.object({
+        serviceId: z.number().optional(),
+        serviceName: z.string().min(1),
+        rationale: z.string().min(1),
+      })
+    ),
+    instruction: z
+      .string()
+      .max(300, 'Instruction must be at most 300 characters')
+      .optional()
+      .transform((val) => (val && val.trim().length > 0 ? val.trim() : undefined)),
+  }),
+});
+
 export class CompanyMinerController {
   async mineCompany(req: AuthRequest, res: Response, next: NextFunction): Promise<void> {
     try {
@@ -104,6 +137,51 @@ export class CompanyMinerController {
         return;
       }
       if (
+        message === 'AI extraction is not configured' ||
+        message === 'AI extraction failed' ||
+        message === 'AI returned no content' ||
+        message === 'AI extraction returned invalid structure' ||
+        message === 'AI extraction returned invalid response'
+      ) {
+        sendError(res, message, 502);
+        return;
+      }
+      next(err);
+    }
+  }
+
+  async generateServiceEmail(
+    req: AuthRequest,
+    res: Response,
+    next: NextFunction
+  ): Promise<void> {
+    try {
+      const {
+        companyUrl,
+        minedResult,
+        suggestedServices,
+        instruction,
+      } = req.body as {
+        companyUrl: string;
+        minedResult: Parameters<typeof companyMinerService.generateServicePitchEmail>[0]['minedResult'];
+        suggestedServices: Parameters<
+          typeof companyMinerService.generateServicePitchEmail
+        >[0]['suggestedServices'];
+        instruction?: string;
+      };
+
+      const generated = await companyMinerService.generateServicePitchEmail({
+        companyUrl,
+        minedResult,
+        suggestedServices,
+        instruction,
+      });
+
+      sendSuccess(res, 'Service email generated successfully', generated, 200);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      if (
+        message === 'No suggested services available to generate email' ||
         message === 'AI extraction is not configured' ||
         message === 'AI extraction failed' ||
         message === 'AI returned no content' ||
