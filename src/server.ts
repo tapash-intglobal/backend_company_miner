@@ -12,6 +12,7 @@ const startServer = async (): Promise<void> => {
     app.listen(config.port, () => {
       logger.info(`Server running on port ${config.port} (${config.env})`);
       logger.info(`API: http://localhost:${config.port}/api/${config.apiVersion}`);
+      logger.info(`Swagger UI: http://localhost:${config.port}/api-docs`);
     });
   } catch (err) {
     const message = err instanceof Error ? err.message : String(err);
