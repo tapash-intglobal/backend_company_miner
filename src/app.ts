@@ -13,7 +13,18 @@ import { swaggerSpec } from './config/swagger';
 
 const app: Application = express();
 
-app.use(helmet());
+app.use(
+  helmet({
+    contentSecurityPolicy: {
+      directives: {
+        ...helmet.contentSecurityPolicy.getDefaultDirectives(),
+        // Staging currently serves over plain HTTP. Prevent Swagger asset URLs
+        // from being auto-upgraded to HTTPS (which causes ERR_SSL_PROTOCOL_ERROR).
+        'upgrade-insecure-requests': null,
+      },
+    },
+  })
+);
 app.use(
   cors({
     origin: config.cors.origin,
