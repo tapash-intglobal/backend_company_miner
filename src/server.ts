@@ -3,11 +3,14 @@ import logger from './utils/logger';
 import sequelize from './config/database';
 import './models';
 import app from './app';
+import zohoMinerJobService from './services/integrations/ZohoMinerJobService';
 
 const startServer = async (): Promise<void> => {
   try {
     await sequelize.authenticate();
     logger.info('Database connection established');
+
+    zohoMinerJobService.startWorker();
 
     app.listen(config.port, () => {
       logger.info(`Server running on port ${config.port} (${config.env})`);
@@ -26,6 +29,7 @@ startServer();
 const shutdown = async (): Promise<void> => {
   logger.info('Shutting down');
   try {
+    zohoMinerJobService.stopWorker();
     await sequelize.close();
     process.exit(0);
   } catch (err) {

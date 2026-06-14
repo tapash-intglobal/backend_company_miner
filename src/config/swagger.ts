@@ -25,6 +25,12 @@ const swaggerDefinition = {
         scheme: 'bearer',
         bearerFormat: 'JWT',
       },
+      integrationApiKey: {
+        type: 'apiKey',
+        in: 'header',
+        name: 'X-API-Key',
+        description: 'Integration API key for Zoho webhooks (Bearer token also accepted)',
+      },
     },
     schemas: {
       ApiSuccess: {
@@ -101,6 +107,25 @@ const swaggerDefinition = {
           isActive: { type: 'boolean' },
           createdAt: { type: 'string', format: 'date-time' },
           updatedAt: { type: 'string', format: 'date-time' },
+        },
+      },
+      ZohoMinerJobStatus: {
+        type: 'object',
+        properties: {
+          job_id: { type: 'string', format: 'uuid' },
+          lead_id: { type: 'string' },
+          status: {
+            type: 'string',
+            enum: ['queued', 'processing', 'completed', 'failed'],
+          },
+          website: { type: 'string', nullable: true },
+          resolved_website: { type: 'string', nullable: true },
+          pdf_filename: { type: 'string', nullable: true },
+          zoho_attachment_id: { type: 'string', nullable: true },
+          error_message: { type: 'string', nullable: true },
+          created_at: { type: 'string', format: 'date-time' },
+          started_at: { type: 'string', format: 'date-time', nullable: true },
+          completed_at: { type: 'string', format: 'date-time', nullable: true },
         },
       },
     },
@@ -359,6 +384,87 @@ const swaggerDefinition = {
           { name: 'id', in: 'path', required: true, schema: { type: 'integer' } },
         ],
         responses: { '200': { description: 'Master service deleted' } },
+      },
+    },
+    '/integrations/zoho/leads/process': {
+      post: {
+        tags: ['Zoho Integration'],
+        summary: 'Enqueue Company Miner job for a Zoho lead (async)',
+        description:
+          'Accepts lead_id and optional website. If website is omitted, the worker fetches it from Zoho CRM. Returns 202 immediately; mining and PDF attachment upload run in background.',
+        security: [{ integrationApiKey: [] }],
+        requestBody: {
+          required: true,
+          content: {
+            'application/json': {
+              schema: {
+                type: 'object',
+                required: ['lead_id'],
+                properties: {
+                  lead_id: { type: 'string', example: '1234567890123456789' },
+                  website: { type: 'string', example: 'https://acme.com' },
+                  company: { type: 'string' },
+                  email: { type: 'string' },
+                  first_name: { type: 'string' },
+                  last_name: { type: 'string' },
+                },
+              },
+            },
+          },
+        },
+        responses: {
+          '202': {
+            description: 'Job accepted',
+            content: {
+              'application/json': {
+                schema: {
+                  allOf: [
+                    { $ref: '#/components/schemas/ApiSuccess' },
+                    {
+                      type: 'object',
+                      properties: {
+                        data: { $ref: '#/components/schemas/ZohoMinerJobStatus' },
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+          '400': { description: 'Validation error' },
+          '401': { description: 'Invalid integration API key' },
+        },
+      },
+    },
+    '/integrations/zoho/jobs/{jobId}': {
+      get: {
+        tags: ['Zoho Integration'],
+        summary: 'Get Zoho miner job status',
+        security: [{ integrationApiKey: [] }],
+        parameters: [
+          { name: 'jobId', in: 'path', required: true, schema: { type: 'string', format: 'uuid' } },
+        ],
+        responses: {
+          '200': {
+            description: 'Job status',
+            content: {
+              'application/json': {
+                schema: {
+                  allOf: [
+                    { $ref: '#/components/schemas/ApiSuccess' },
+                    {
+                      type: 'object',
+                      properties: {
+                        data: { $ref: '#/components/schemas/ZohoMinerJobStatus' },
+                      },
+                    },
+                  ],
+                },
+              },
+            },
+          },
+          '404': { description: 'Job not found' },
+        },
       },
     },
   },

@@ -1,8 +1,7 @@
-import OpenAI from 'openai';
 import { z } from 'zod';
 import { search as duckDuckGoSearch, SafeSearchType } from 'duck-duck-scrape';
-import config from '../../config';
 import logger from '../../utils/logger';
+import { createLlmProvider, type LlmProvider } from '../llm';
 
 const WEBSITE_FETCH_TIMEOUT_MS = 8000;
 const WEBSITE_MAX_CHARS = 10000;
@@ -57,20 +56,22 @@ const companyMinerResponseSchema = z.object({
 });
 
 export class CompanyMinerService {
-  private readonly client: OpenAI | null = null;
+  private readonly llm: LlmProvider = createLlmProvider();
   private yahooFinancePromise: Promise<Record<string, unknown>> | null = null;
+
+  private async completeJson(
+    systemPrompt: string,
+    userPrompt: string,
+    options: { temperature: number; maxTokens: number }
+  ): Promise<string> {
+    return this.llm.completeJson(systemPrompt, userPrompt, options);
+  }
 
   private async getYahooFinance(): Promise<Record<string, unknown>> {
     if (!this.yahooFinancePromise) {
       this.yahooFinancePromise = import('yahoo-finance2').then((m: { default: new () => Record<string, unknown> }) => new m.default());
     }
     return this.yahooFinancePromise;
-  }
-
-  constructor() {
-    if (config.openai?.apiKey?.trim()) {
-      this.client = new OpenAI({ apiKey: config.openai.apiKey.trim() });
-    }
   }
 
   /**
@@ -110,8 +111,8 @@ export class CompanyMinerService {
   }
 
   /**
-   * Mine company info from a website URL: fetch content, then extract via OpenAI.
-   * No cache; no DB. Normalizes URL (accepts domain-only), fetches page, strips HTML, calls OpenAI, returns DTO.
+   * Mine company info from a website URL: fetch content, then extract via configured LLM.
+   * No cache; no DB. Normalizes URL (accepts domain-only), fetches page, strips HTML, calls configured LLM, returns DTO.
    * When an optional instruction is provided, the AI is asked to prioritize that focus area.
    */
   async mineCompany(url: string, instruction?: string): Promise<CompanyMinerResult> {
@@ -122,8 +123,8 @@ export class CompanyMinerService {
       throw new Error('Could not fetch website content or content was too short to analyze');
     }
 
-    if (!this.client) {
-      logger.warn('Company Miner: OpenAI not configured');
+    if (!this.llm.isConfigured()) {
+      logger.warn('Company Miner: AI provider not configured', { provider: this.llm.id });
       throw new Error('AI extraction is not configured');
     }
 
@@ -177,7 +178,7 @@ export class CompanyMinerService {
     }
 
     // Industry-based peer search: whenever we have industry, fetch peer companies in that industry and merge (ensures competitors section is usually populated)
-    if (result.industry?.trim() && this.client) {
+    if (result.industry?.trim() && this.llm.isConfigured()) {
       const domain = new URL(normalizedUrl).hostname.replace(/^www\./i, '');
       const baseName = domain.split('.')[0] ?? domain;
       const industryPeers = await this.enrichCompetitorsFromIndustrySearch(result.industry.trim());
@@ -194,7 +195,7 @@ export class CompanyMinerService {
     }
 
     // Dedicated competitor search when still none: company-specific queries (e.g. "Acme competitors")
-    if (result.competitors.length === 0 && this.client) {
+    if (result.competitors.length === 0 && this.llm.isConfigured()) {
       const dedicatedCompetitors = await this.enrichCompetitorsFromDedicatedSearch(normalizedUrl, result);
       if (dedicatedCompetitors.length > 0) {
         result = {
@@ -206,7 +207,7 @@ export class CompanyMinerService {
     }
 
     // Synchronous deep-search fallback for commonly sparse sections.
-    if (this.client && (result.currentChallenges.length === 0 || result.competitors.length === 0)) {
+    if (this.llm.isConfigured() && (result.currentChallenges.length === 0 || result.competitors.length === 0)) {
       const deep = await this.enrichFromDeepSearch(normalizedUrl, result);
       if (deep) {
         const filledChallenges = result.currentChallenges.length === 0 && deep.currentChallenges.length > 0;
@@ -501,7 +502,7 @@ export class CompanyMinerService {
     currentChallenges: string[];
     competitors: string[];
   }> {
-    if (!this.client) {
+    if (!this.llm.isConfigured()) {
       return { top5SourcesOfIncome: [], financialResultsLatest5: [], currentChallenges: [], competitors: [] };
     }
     const systemPrompt = `You are a financial data extractor. Given text from web search results about a company, output valid JSON only with four keys:
@@ -514,16 +515,10 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
 
     const userPrompt = `Extract from this text:\n${text.slice(0, 8000)}`;
     try {
-      const completion = await this.client.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
+      const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.2,
-        max_tokens: 1024,
+        maxTokens: 1024,
       });
-      const raw = completion.choices[0]?.message?.content?.trim();
       if (!raw)
         return {
           top5SourcesOfIncome: [],
@@ -627,7 +622,7 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
     mode: 'competitor' | 'industry',
     industryName?: string
   ): Promise<string[]> {
-    if (!this.client) return [];
+    if (!this.llm.isConfigured()) return [];
     const industryHint =
       mode === 'industry' && industryName
         ? ` Focus on companies that operate in or serve the "${industryName}" industry.`
@@ -638,16 +633,10 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
         : `You are an industry analyst. Given text about companies in an industry (e.g. lists like "top companies in X", "leading X companies", "X market players"), extract up to 10 company names that are mentioned as operating in or serving that industry.${industryHint} Return only company names that actually appear in the text; do not invent. Output valid JSON only: {"competitors": ["Name1", "Name2", ...]}. No markdown, no code block.`;
     const userPrompt = `Extract peer/competitor company names from this text:\n${text.slice(0, 8000)}`;
     try {
-      const completion = await this.client.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
+      const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.2,
-        max_tokens: 512,
+        maxTokens: 512,
       });
-      const raw = completion.choices[0]?.message?.content?.trim();
       if (!raw) return [];
       let jsonStr = raw;
       const codeBlockMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -675,7 +664,7 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
     text: string,
     context: { baseName: string; industryHint?: string }
   ): Promise<{ currentChallenges: string[]; competitors: string[] }> {
-    if (!this.client) return { currentChallenges: [], competitors: [] };
+    if (!this.llm.isConfigured()) return { currentChallenges: [], competitors: [] };
 
     const systemPrompt = `You are an enterprise research analyst.
 From the provided public web evidence, extract only verifiable:
@@ -695,16 +684,10 @@ Evidence:
 ${text.slice(0, 22000)}`;
 
     try {
-      const completion = await this.client.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
+      const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.2,
-        max_tokens: 900,
+        maxTokens: 900,
       });
-      const raw = completion.choices[0]?.message?.content?.trim();
       if (!raw) return { currentChallenges: [], competitors: [] };
 
       let jsonStr = raw;
@@ -803,17 +786,10 @@ Output only a single JSON object with keys: aboutTheCompany, products, services,
     )}${focusText}`;
 
     try {
-      const completion = await this.client!.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
+      const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.2,
-        max_tokens: 1536,
+        maxTokens: 1536,
       });
-
-      const raw = completion.choices[0]?.message?.content?.trim();
       if (!raw) {
         throw new Error('AI returned no content');
       }
@@ -846,30 +822,30 @@ Output only a single JSON object with keys: aboutTheCompany, products, services,
       };
     } catch (err) {
       if (err instanceof z.ZodError) {
-        logger.warn('Company Miner: OpenAI response failed Zod validation', { errors: err.errors });
+        logger.warn('Company Miner: AI response failed Zod validation', { errors: err.errors });
         throw new Error('AI extraction returned invalid structure');
       }
       if (err instanceof SyntaxError) {
-        logger.warn('Company Miner: OpenAI response was not valid JSON', { error: err });
+        logger.warn('Company Miner: AI response was not valid JSON', { error: err });
         throw new Error('AI extraction returned invalid response');
       }
       if (err instanceof Error && err.message.startsWith('AI ')) {
         throw err;
       }
-      logger.warn('Company Miner: OpenAI call failed', { error: err });
+      logger.warn('Company Miner: AI call failed', { error: err });
       throw new Error('AI extraction failed');
     }
   }
 
   /**
    * Suggest up to 5 services we can provide to help the mined company grow.
-   * Uses OpenAI with company profile + our master service list. Returns empty array on failure.
+   * Uses configured LLM with company profile + our master service list. Returns empty array on failure.
    */
   async suggestServicesWeCanProvide(
     minedResult: CompanyMinerResult,
     masterServices: { id: number; name: string }[]
   ): Promise<SuggestedServiceWeCanProvide[]> {
-    if (!this.client || masterServices.length === 0) return [];
+    if (!this.llm.isConfigured() || masterServices.length === 0) return [];
 
     const companySummary = [
       minedResult.aboutTheCompany && `About: ${minedResult.aboutTheCompany}`,
@@ -896,16 +872,10 @@ Output valid JSON only: an array of objects with keys "serviceName" (string, mus
     const userPrompt = `Our services we offer (choose only from this list):\n${ourServicesList}\n\nCompany profile:\n${companySummary.slice(0, 4000)}\n\nSuggest up to 5 services we can provide to help this company grow, with a short rationale for each.`;
 
     try {
-      const completion = await this.client.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
+      const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.3,
-        max_tokens: 800,
+        maxTokens: 800,
       });
-      const raw = completion.choices[0]?.message?.content?.trim();
       if (!raw) return [];
       let jsonStr = raw;
       const codeBlockMatch = raw.match(/```(?:json)?\s*([\s\S]*?)```/);
@@ -946,7 +916,7 @@ Output valid JSON only: an array of objects with keys "serviceName" (string, mus
     suggestedServices: SuggestedServiceWeCanProvide[];
     instruction?: string;
   }): Promise<GeneratedServiceEmail> {
-    if (!this.client) {
+    if (!this.llm.isConfigured()) {
       throw new Error('AI extraction is not configured');
     }
 
@@ -999,17 +969,10 @@ ${servicesContext.slice(0, 3500)}${extraInstruction}
 Generate the JSON response now.`;
 
     try {
-      const completion = await this.client.chat.completions.create({
-        model: 'gpt-4o-mini',
-        messages: [
-          { role: 'system', content: systemPrompt },
-          { role: 'user', content: userPrompt },
-        ],
+      const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.3,
-        max_tokens: 900,
+        maxTokens: 900,
       });
-
-      const raw = completion.choices[0]?.message?.content?.trim();
       if (!raw) {
         throw new Error('AI returned no content');
       }
