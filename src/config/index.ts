@@ -41,7 +41,7 @@ const config = {
     apiKey: process.env.OPENAI_API_KEY || '',
   },
   ai: {
-    provider: (process.env.AI_PROVIDER || 'openai').toLowerCase(),
+    provider: (process.env.AI_PROVIDER || 'gemini').toLowerCase(),
     openai: {
       apiKey: process.env.OPENAI_API_KEY || '',
       model: process.env.OPENAI_MODEL || 'gpt-4o-mini',
@@ -49,7 +49,15 @@ const config = {
     gemini: {
       apiKey: process.env.GEMINI_API_KEY || '',
       model: process.env.GEMINI_MODEL || 'gemini-2.5-flash',
+      maxOutputTokensMain: Number.parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS_MAIN || '4096', 10),
+      maxOutputTokensDefault: Number.parseInt(process.env.GEMINI_MAX_OUTPUT_TOKENS_DEFAULT || '2048', 10),
+      requestTimeoutMs: Number.parseInt(process.env.GEMINI_REQUEST_TIMEOUT_MS || '120000', 10),
     },
+  },
+  companyMiner: {
+    publicSearchEnrich: process.env.COMPANY_MINER_PUBLIC_SEARCH_ENRICH !== 'false',
+    industryPeerSearch: process.env.COMPANY_MINER_INDUSTRY_PEER_SEARCH !== 'false',
+    deepSearch: process.env.COMPANY_MINER_DEEP_SEARCH !== 'false',
   },
   zoho: {
     clientId: process.env.ZOHO_CLIENT_ID || '',

@@ -12,6 +12,33 @@ function stripJsonFence(raw: string): string {
   return trimmed;
 }
 
+function extractGeminiErrorStatus(err: unknown): number | undefined {
+  if (err && typeof err === 'object' && 'status' in err) {
+    const status = (err as { status?: unknown }).status;
+    if (typeof status === 'number') return status;
+  }
+  return undefined;
+}
+
+function isQuotaOrRateLimitError(err: unknown): boolean {
+  const status = extractGeminiErrorStatus(err);
+  if (status === 429) return true;
+  const message = err instanceof Error ? err.message : String(err);
+  const lower = message.toLowerCase();
+  return lower.includes('quota') || lower.includes('rate limit') || lower.includes('resource_exhausted');
+}
+
+function mapGeminiError(err: unknown): Error {
+  if (isQuotaOrRateLimitError(err)) {
+    return new Error('Gemini rate limit exceeded (429)');
+  }
+  const status = extractGeminiErrorStatus(err);
+  if (status === 503) {
+    return new Error('Gemini service unavailable (503)');
+  }
+  return new Error('AI extraction failed');
+}
+
 export class GeminiProvider implements LlmProvider {
   readonly id = 'gemini' as const;
   readonly model: string;
@@ -37,7 +64,8 @@ export class GeminiProvider implements LlmProvider {
     }
 
     const temperature = options.temperature ?? 0.2;
-    const maxTokens = options.maxTokens ?? 1024;
+    const maxTokens = options.maxTokens ?? config.ai.gemini.maxOutputTokensDefault;
+    const timeoutMs = config.ai.gemini.requestTimeoutMs;
 
     try {
       const model = this.client.getGenerativeModel({
@@ -45,7 +73,7 @@ export class GeminiProvider implements LlmProvider {
         systemInstruction: systemPrompt,
       });
 
-      const result = await model.generateContent({
+      const generatePromise = model.generateContent({
         contents: [{ role: 'user', parts: [{ text: userPrompt }] }],
         generationConfig: {
           temperature,
@@ -54,14 +82,58 @@ export class GeminiProvider implements LlmProvider {
         },
       });
 
-      const raw = result.response.text()?.trim();
+      const result = await Promise.race([
+        generatePromise,
+        new Promise<never>((_, reject) => {
+          setTimeout(() => reject(new Error('Gemini request timed out')), timeoutMs);
+        }),
+      ]);
+
+      const response = result.response;
+      const candidate = response.candidates?.[0];
+      const finishReason = candidate?.finishReason;
+
+      const usage = response.usageMetadata;
+      if (usage) {
+        logger.debug('Gemini completion usage', {
+          model: this.model,
+          finishReason,
+          promptTokenCount: usage.promptTokenCount,
+          candidatesTokenCount: usage.candidatesTokenCount,
+          totalTokenCount: usage.totalTokenCount,
+        });
+      }
+
+      if (finishReason === 'SAFETY' || finishReason === 'RECITATION') {
+        throw new Error('AI content blocked by Gemini safety filters');
+      }
+
+      const raw = response.text()?.trim();
       if (!raw) {
         throw new Error('AI returned no content');
       }
+
+      if (finishReason === 'MAX_TOKENS') {
+        logger.warn('Gemini response truncated (MAX_TOKENS)', {
+          model: this.model,
+          maxOutputTokens: maxTokens,
+          rawLength: raw.length,
+        });
+        throw new Error('AI response truncated');
+      }
+
       return stripJsonFence(raw);
     } catch (err) {
+      if (err instanceof Error && err.message === 'Gemini request timed out') {
+        logger.warn('Company Miner: Gemini request timed out', { model: this.model, timeoutMs });
+        throw err;
+      }
+      if (err instanceof Error && err.message.startsWith('AI ')) {
+        logger.warn('Company Miner: Gemini completion issue', { model: this.model, message: err.message });
+        throw err;
+      }
       logger.warn('Company Miner: Gemini completion failed', { model: this.model, error: err });
-      throw new Error('AI extraction failed');
+      throw mapGeminiError(err);
     }
   }
 }

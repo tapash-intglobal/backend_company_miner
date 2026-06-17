@@ -1,5 +1,6 @@
 import { z } from 'zod';
 import { search as duckDuckGoSearch, SafeSearchType } from 'duck-duck-scrape';
+import config from '../../config';
 import logger from '../../utils/logger';
 import { createLlmProvider, type LlmProvider } from '../llm';
 
@@ -153,7 +154,7 @@ export class CompanyMinerService {
       result.top5SourcesOfIncome.length === 0 ||
       result.currentChallenges.length === 0 ||
       result.competitors.length === 0;
-    if (needPublicSearch) {
+    if (needPublicSearch && config.companyMiner.publicSearchEnrich) {
       const enriched = await this.enrichFromPublicSearch(normalizedUrl, result);
       if (enriched) {
         const filledIncome = enriched.top5SourcesOfIncome.length > 0;
@@ -178,7 +179,7 @@ export class CompanyMinerService {
     }
 
     // Industry-based peer search: whenever we have industry, fetch peer companies in that industry and merge (ensures competitors section is usually populated)
-    if (result.industry?.trim() && this.llm.isConfigured()) {
+    if (result.industry?.trim() && this.llm.isConfigured() && config.companyMiner.industryPeerSearch) {
       const domain = new URL(normalizedUrl).hostname.replace(/^www\./i, '');
       const baseName = domain.split('.')[0] ?? domain;
       const industryPeers = await this.enrichCompetitorsFromIndustrySearch(result.industry.trim());
@@ -195,7 +196,7 @@ export class CompanyMinerService {
     }
 
     // Dedicated competitor search when still none: company-specific queries (e.g. "Acme competitors")
-    if (result.competitors.length === 0 && this.llm.isConfigured()) {
+    if (result.competitors.length === 0 && this.llm.isConfigured() && config.companyMiner.publicSearchEnrich) {
       const dedicatedCompetitors = await this.enrichCompetitorsFromDedicatedSearch(normalizedUrl, result);
       if (dedicatedCompetitors.length > 0) {
         result = {
@@ -207,7 +208,11 @@ export class CompanyMinerService {
     }
 
     // Synchronous deep-search fallback for commonly sparse sections.
-    if (this.llm.isConfigured() && (result.currentChallenges.length === 0 || result.competitors.length === 0)) {
+    if (
+      config.companyMiner.deepSearch &&
+      this.llm.isConfigured() &&
+      (result.currentChallenges.length === 0 || result.competitors.length === 0)
+    ) {
       const deep = await this.enrichFromDeepSearch(normalizedUrl, result);
       if (deep) {
         const filledChallenges = result.currentChallenges.length === 0 && deep.currentChallenges.length > 0;
@@ -517,7 +522,7 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
     try {
       const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.2,
-        maxTokens: 1024,
+        maxTokens: config.ai.gemini.maxOutputTokensDefault,
       });
       if (!raw)
         return {
@@ -635,7 +640,7 @@ Output only a JSON object with keys top5SourcesOfIncome, financialResultsLatest5
     try {
       const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.2,
-        maxTokens: 512,
+        maxTokens: config.ai.gemini.maxOutputTokensDefault,
       });
       if (!raw) return [];
       let jsonStr = raw;
@@ -686,7 +691,7 @@ ${text.slice(0, 22000)}`;
     try {
       const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.2,
-        maxTokens: 900,
+        maxTokens: config.ai.gemini.maxOutputTokensDefault,
       });
       if (!raw) return { currentChallenges: [], competitors: [] };
 
@@ -788,7 +793,7 @@ Output only a single JSON object with keys: aboutTheCompany, products, services,
     try {
       const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.2,
-        maxTokens: 1536,
+        maxTokens: config.ai.gemini.maxOutputTokensMain,
       });
       if (!raw) {
         throw new Error('AI returned no content');
@@ -874,7 +879,7 @@ Output valid JSON only: an array of objects with keys "serviceName" (string, mus
     try {
       const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.3,
-        maxTokens: 800,
+        maxTokens: config.ai.gemini.maxOutputTokensDefault,
       });
       if (!raw) return [];
       let jsonStr = raw;
@@ -971,7 +976,7 @@ Generate the JSON response now.`;
     try {
       const raw = await this.completeJson(systemPrompt, userPrompt, {
         temperature: 0.3,
-        maxTokens: 900,
+        maxTokens: config.ai.gemini.maxOutputTokensDefault,
       });
       if (!raw) {
         throw new Error('AI returned no content');

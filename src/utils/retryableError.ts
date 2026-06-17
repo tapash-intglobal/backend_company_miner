@@ -16,8 +16,16 @@ const RETRYABLE_NETWORK_PATTERNS = [
   'etimedout',
   'econnrefused',
   'socket hang up',
-  'rate limit',
   'temporarily unavailable',
+];
+
+const RETRYABLE_AI_PATTERNS = [
+  'ai response truncated',
+  'ai extraction returned invalid response',
+  'gemini rate limit exceeded',
+  'gemini service unavailable',
+  'gemini request timed out',
+  'ai extraction failed',
 ];
 
 export function isRetryableJobError(err: unknown): boolean {
@@ -39,7 +47,15 @@ export function isRetryableJobError(err: unknown): boolean {
 
   if (err instanceof Error) {
     const msg = err.message.toLowerCase();
-    return RETRYABLE_NETWORK_PATTERNS.some((pattern) => msg.includes(pattern));
+    if (RETRYABLE_NETWORK_PATTERNS.some((pattern) => msg.includes(pattern))) {
+      return true;
+    }
+    if (RETRYABLE_AI_PATTERNS.some((pattern) => msg.includes(pattern))) {
+      return true;
+    }
+    if (msg.includes('rate limit') || msg.includes('quota')) {
+      return true;
+    }
   }
 
   return false;
